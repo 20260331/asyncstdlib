@@ -380,3 +380,491 @@ async def test_misuse_enter_context():
             except KeyError:
                 await exit_stack.enter_context(None)
         assert type(exc_info.value.__context__.__context__) is KeyError
+
+
+class _AsyncExitSuppressing:
+    """Async context manager whose ``__aexit__`` records and may suppress"""
+
+    def __init__(self, name, witness, *, suppress=()):
+        self.name = name
+        self.witness = witness
+        self.suppress = suppress
+        self.exits = 0
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self.exits += 1
+        self.witness.append(("aexit", self.name, type(exc_val)))
+        return isinstance(exc_val, self.suppress) if self.suppress else False
+
+
+@sync
+async def test_exit_stack_checkpoint_type():
+    stack = a.ExitStack()
+    group = stack.checkpoint()
+    assert isinstance(group, a.ExitStackCheckpoint)
+    assert isinstance(group, a.ExitStack)
+
+
+@sync
+async def test_exit_stack_checkpoint_commit_staging_and_order():
+    """Staged actions do not run in the block and commit in registration order"""
+    witness: list[str] = []
+    async with a.ExitStack() as stack:
+        stack.callback(witness.append, "outer-before")
+        async with stack.checkpoint() as group:
+            group.callback(witness.append, "g0")
+            group.callback(witness.append, "g1")
+            # nothing runs while the checkpoint is still open
+            assert witness == []
+        # committed but not unwound yet
+        assert witness == []
+        stack.callback(witness.append, "outer-after")
+    # LIFO of the merged stack:
+    # outer-after, g1, g0, outer-before
+    assert witness == ["outer-after", "g1", "g0", "outer-before"]
+
+
+@sync
+async def test_exit_stack_checkpoint_commit_runs_each_action_once():
+    witness = MockAsyncContext()
+    sync_witness = MockContext()
+    async with a.ExitStack() as stack:
+        async with stack.checkpoint() as group:
+            assert await group.enter_context(a.nullcontext("value")) == "value"
+            await group.enter_context(witness)
+            await group.enter_context(sync_witness)
+            group.push(MockAsyncContext())
+            group.push(MockContext())
+    assert witness.entered and witness.exited
+    assert sync_witness.entered and sync_witness.exited
+
+
+@sync
+async def test_exit_stack_checkpoint_commit_mixed_kinds():
+    """push/callback/enter_context with sync/async and __exit__/__aexit__"""
+    witness: list[str] = []
+
+    async def async_cb(value):
+        witness.append(value)
+
+    def sync_cb(value):
+        witness.append(value)
+
+    async def async_exit(exc_type, exc_val, tb):
+        witness.append("push-async")
+        return False
+
+    def sync_exit(exc_type, exc_val, tb):
+        witness.append("push-sync")
+        return False
+
+    async_cm = MockAsyncContext("async-cm")
+    sync_cm = MockContext("sync-cm")
+    async with a.ExitStack() as stack:
+        async with stack.checkpoint() as group:
+            group.callback(async_cb, "async-callback")
+            group.callback(sync_cb, "sync-callback")
+            group.push(async_exit)
+            group.push(sync_exit)
+            await group.enter_context(async_cm)
+            await group.enter_context(sync_cm)
+        assert witness == []
+    # LIFO after the two context managers, which record on their attributes
+    assert async_cm.entered and async_cm.exited
+    assert sync_cm.entered and sync_cm.exited
+    assert witness == [
+        "push-sync",
+        "push-async",
+        "sync-callback",
+        "async-callback",
+    ]
+
+
+@sync
+async def test_exit_stack_checkpoint_rollback_runs_group_only():
+    """On exception the group unwinds locally; the outer stack never runs it"""
+    witness: list[str] = []
+    stack = a.ExitStack()
+    stack.callback(witness.append, "outer")
+    with pytest.raises(KeyError):
+        async with stack.checkpoint() as group:
+            group.callback(witness.append, "g0")
+            group.callback(witness.append, "g1")
+            raise KeyError()
+    # group actions ran immediately, in reverse order, exactly once
+    assert witness == ["g1", "g0"]
+    await stack.aclose()
+    assert witness == ["g1", "g0", "outer"]
+
+
+@sync
+async def test_exit_stack_checkpoint_rollback_with_outer_unwind():
+    """An unhandled rollback still unwinds the surrounding stack afterwards"""
+    witness: list[str] = []
+    with pytest.raises(KeyError):
+        async with a.ExitStack() as stack:
+            stack.callback(witness.append, "outer")
+            async with stack.checkpoint() as group:
+                group.callback(witness.append, "g0")
+                raise KeyError()
+    assert witness == ["g0", "outer"]
+
+
+@sync
+async def test_exit_stack_checkpoint_rollback_exception_args():
+    """Rolled back actions see the original exception details"""
+    seen = []
+    error = KeyError("rollback")
+
+    async def observe(exc_type, exc_val, tb):
+        seen.append((exc_type, exc_val, tb))
+        return False
+
+    with pytest.raises(KeyError):
+        async with a.ExitStack().checkpoint() as group:
+            group.push(observe)
+            raise error
+    assert seen == [(KeyError, error, error.__traceback__)]
+
+
+@sync
+async def test_exit_stack_checkpoint_rollback_suppress():
+    """Exception suppression works exactly as for a plain ExitStack"""
+    witness: list[str] = []
+    async with a.ExitStack() as stack:
+        stack.callback(witness.append, "outer")
+        async with stack.checkpoint() as group:
+            group.callback(witness.append, "g")
+            group.push(
+                _AsyncExitSuppressing("suppressor", witness, suppress=(KeyError,))
+            )
+            raise KeyError()
+        # the checkpoint suppressed the KeyError and execution continues here
+    # rollback order: suppressor (LIFO, suppresses), then callback g;
+    # the outer stack unwinds with no exception afterwards
+    assert [item for item in witness if isinstance(item, str)] == ["g", "outer"]
+
+
+@sync
+async def test_exit_stack_checkpoint_rollback_does_not_suppress_other():
+    witness = _AsyncExitSuppressing("suppressor", [], suppress=(ValueError,))
+    with pytest.raises(KeyError):
+        async with a.ExitStack().checkpoint() as group:
+            group.push(witness)
+            raise KeyError()
+    assert witness.exits == 1
+
+
+@sync
+async def test_exit_stack_checkpoint_direct_outer_registration_is_isolated():
+    """Actions registered directly on the outer stack bypass the checkpoint"""
+    witness: list[str] = []
+    stack = a.ExitStack()
+    stack.callback(witness.append, "outer-before")
+    with pytest.raises(KeyError):
+        async with stack.checkpoint() as group:
+            stack.callback(witness.append, "outer-during")
+            group.callback(witness.append, "g")
+            raise KeyError()
+    # rollback only touches the group
+    assert witness == ["g"]
+    await stack.aclose()
+    assert witness == ["g", "outer-during", "outer-before"]
+
+
+@sync
+async def test_exit_stack_checkpoint_nested_commit():
+    witness: list[str] = []
+    async with a.ExitStack() as stack:
+        async with stack.checkpoint() as outer:
+            outer.callback(witness.append, "o0")
+            async with outer.checkpoint() as inner:
+                inner.callback(witness.append, "i0")
+                inner.callback(witness.append, "i1")
+            outer.callback(witness.append, "o1")
+    # merged stack is [o0, i0, i1, o1] and unwinds LIFO
+    assert witness == ["o1", "i1", "i0", "o0"]
+
+
+@sync
+async def test_exit_stack_checkpoint_nested_inner_rollback_contained():
+    """A suppressed inner rollback leaves the outer checkpoint intact"""
+    witness: list[str] = []
+    async with a.ExitStack() as stack:
+        async with stack.checkpoint() as outer:
+            outer.callback(witness.append, "o0")
+            with pytest.raises(KeyError):
+                async with outer.checkpoint() as inner:
+                    inner.callback(witness.append, "i0")
+                    raise KeyError()
+            assert witness == ["i0"]
+            outer.callback(witness.append, "o1")
+    assert witness == ["i0", "o1", "o0"]
+
+
+@sync
+async def test_exit_stack_checkpoint_nested_inner_rollback_propagates():
+    """An inner rollback that propagates also rolls back the outer group once"""
+    witness: list[str] = []
+    with pytest.raises(KeyError):
+        async with a.ExitStack().checkpoint() as outer:
+            outer.callback(witness.append, "o0")
+            async with outer.checkpoint() as inner:
+                inner.callback(witness.append, "i0")
+                raise KeyError()
+    assert witness == ["i0", "o0"]
+
+
+@sync
+async def test_exit_stack_checkpoint_nested_commit_then_outer_rollback():
+    """Committed inner actions belong to the outer group and roll back with it"""
+    witness: list[str] = []
+    with pytest.raises(KeyError):
+        async with a.ExitStack().checkpoint() as outer:
+            outer.callback(witness.append, "o0")
+            async with outer.checkpoint() as inner:
+                inner.callback(witness.append, "i0")
+            # inner committed; raising now must run i0 exactly once
+            raise KeyError()
+    assert witness == ["i0", "o0"]
+
+
+@sync
+async def test_exit_stack_checkpoint_commit_after_parent_finalized():
+    """If the parent checkpoint was closed manually, the child unwinds locally"""
+    witness: list[str] = []
+    async with a.ExitStack() as stack:
+        async with stack.checkpoint() as outer:
+            outer.callback(witness.append, "o")
+            async with outer.checkpoint() as inner:
+                inner.callback(witness.append, "i")
+                # misuse: finalize the parent while the child is still open
+                await outer.aclose()
+            # the child can no longer commit, so it runs its actions itself
+            assert witness == ["i"]
+    # the early commit handed "o" to the outer stack, which runs it at the end
+    assert witness == ["i", "o"]
+
+
+@sync
+async def test_exit_stack_checkpoint_aclose_commits_early_once():
+    """aclose on an open checkpoint commits; repeated finalization is a no-op"""
+    witness: list[str] = []
+    async with a.ExitStack() as stack:
+        stack.callback(witness.append, "outer")
+        async with stack.checkpoint() as group:
+            group.callback(witness.append, "g")
+            await group.aclose()
+            await group.aclose()
+            assert witness == []
+        # block exit after early commit does not run anything again
+        assert witness == []
+    assert witness == ["g", "outer"]
+
+
+@sync
+async def test_exit_stack_checkpoint_double_finalize_after_rollback():
+    witness: list[str] = []
+    stack = a.ExitStack()
+    group = stack.checkpoint()
+    with pytest.raises(KeyError):
+        async with group:
+            group.callback(witness.append, "g")
+            raise KeyError()
+    assert witness == ["g"]
+    await group.aclose()
+    await group.__aexit__(None, None, None)
+    assert witness == ["g"]
+
+
+@sync
+async def test_exit_stack_checkpoint_register_after_closed():
+    """All staging paths raise RuntimeError after finalization and never enter"""
+    stack = a.ExitStack()
+
+    async def noop(exc_type, exc_val, tb):
+        return False
+
+    for finalizer in (
+        lambda g: g.aclose(),
+        lambda g: g.__aexit__(KeyError, KeyError(), None),
+    ):
+        group = stack.checkpoint()
+        await finalizer(group)
+        with pytest.raises(RuntimeError):
+            group.callback(lambda: None)
+        with pytest.raises(RuntimeError):
+            group.push(noop)
+        not_entered = MockAsyncContext()
+        with pytest.raises(RuntimeError):
+            await group.enter_context(not_entered)
+        assert not not_entered.entered
+        with pytest.raises(RuntimeError):
+            group.pop_all()
+        with pytest.raises(RuntimeError):
+            group.checkpoint()
+
+
+@sync
+async def test_exit_stack_checkpoint_pop_all_detaches_staged():
+    """pop_all transfers staged actions to a standalone stack before commit"""
+    witness: list[str] = []
+    async with a.ExitStack() as stack:
+        stack.callback(witness.append, "outer")
+        async with stack.checkpoint() as group:
+            group.callback(witness.append, "g0")
+            transferred = group.pop_all()
+            group.callback(witness.append, "g1")
+        # only g1 committed; g0 is owned by the transferred stack
+        await transferred.aclose()
+        assert witness == ["g0"]
+    assert witness == ["g0", "g1", "outer"]
+
+
+@sync
+async def test_exit_stack_checkpoint_pop_all_survives_rollback():
+    """Transferred actions are not touched by rollback of the old checkpoint"""
+    witness: list[str] = []
+    stack = a.ExitStack()
+    stack.callback(witness.append, "outer")
+    with pytest.raises(KeyError):
+        async with stack.checkpoint() as group:
+            group.callback(witness.append, "g0")
+            transferred = group.pop_all()
+            group.callback(witness.append, "g1")
+            raise KeyError()
+    assert witness == ["g1"]
+    await transferred.aclose()
+    assert witness == ["g1", "g0"]
+    await stack.aclose()
+    assert witness == ["g1", "g0", "outer"]
+
+
+@sync
+async def test_exit_stack_checkpoint_outer_pop_all_keeps_checkpoint():
+    """pop_all on the outer stack does not detach pending checkpoints"""
+    witness: list[str] = []
+    popped = None
+    async with a.ExitStack() as stack:
+        stack.callback(witness.append, "old")
+        popped = stack.pop_all()
+        async with stack.checkpoint() as group:
+            group.callback(witness.append, "g")
+        # committed into the original stack, not the popped one
+        assert witness == []
+    assert witness == ["g"]
+    await popped.aclose()
+    assert witness == ["g", "old"]
+
+
+@sync
+async def test_exit_stack_checkpoint_rollback_multiple_failures():
+    """Every action is attempted; the newest replacement exception wins"""
+    witness: list[str] = []
+
+    def failing(name, exc):
+        async def exit_cb(exc_type, exc_val, tb):
+            witness.append(name)
+            raise exc
+
+        return exit_cb
+
+    first = KeyError("a")
+    middle = ValueError("b")
+    last = RuntimeError("c")
+    with pytest.raises(KeyError) as exc_info:
+        async with a.ExitStack().checkpoint() as group:
+            group.push(failing("a", first))
+            group.callback(witness.append, "ok")
+            group.push(failing("b", middle))
+            group.push(failing("c", last))
+            raise IndexError("body")
+    # LIFO: c, b, ok, a -- all attempted despite the failures
+    assert witness == ["c", "b", "ok", "a"]
+    assert exc_info.value is first
+    assert first.__context__ is middle
+    assert middle.__context__ is last
+    assert last.__context__ is not None
+    assert type(last.__context__) is IndexError
+
+
+class _Abort(BaseException):
+    pass
+
+
+class _Cancel(BaseException):
+    pass
+
+
+@sync
+async def test_exit_stack_checkpoint_rollback_base_exception():
+    """Any BaseException (e.g. cancellation) unwinds all staged actions"""
+    witness: list[str] = []
+
+    async def aborting(exc_type, exc_val, tb):
+        witness.append("abort")
+        raise _Abort()
+
+    with pytest.raises(_Abort) as exc_info:
+        async with a.ExitStack().checkpoint() as group:
+            group.callback(witness.append, "after")
+            group.push(aborting)
+            group.callback(witness.append, "before")
+            raise _Cancel()
+    # LIFO: before, abort, after -- all attempted despite the _Abort
+    assert witness == ["before", "abort", "after"]
+    # the abort is chained onto the cancellation that triggered rollback
+    assert isinstance(exc_info.value.__context__, _Cancel)
+
+
+@sync
+async def test_exit_stack_checkpoint_rollback_failure_finalizes_once():
+    """A failing rollback finalizes the checkpoint; close afterwards is a no-op"""
+    witness: list[str] = []
+
+    async def aborting(exc_type, exc_val, tb):
+        witness.append("abort")
+        raise _Abort()
+
+    stack = a.ExitStack()
+    group = stack.checkpoint()
+    with pytest.raises(_Abort):
+        async with group:
+            group.callback(witness.append, "ok")
+            group.push(aborting)
+            group.callback(witness.append, "newest")
+            raise _Cancel()
+    assert witness == ["newest", "abort", "ok"]
+    await group.aclose()
+    assert witness == ["newest", "abort", "ok"]
+
+
+@sync
+async def test_exit_stack_checkpoint_enter_context_failure_rolls_back():
+    """A failed __aenter__ rolls back previously staged actions only"""
+    good = MockAsyncContext()
+
+    class FailingEnter(MockAsyncContext):
+        async def __aenter__(self):
+            raise RuntimeError("cannot enter")
+
+    failing = FailingEnter()
+    with pytest.raises(RuntimeError):
+        async with a.ExitStack().checkpoint() as group:
+            await group.enter_context(good)
+            await group.enter_context(failing)
+    assert good.entered and good.exited
+    assert not failing.entered and not failing.exited
+
+
+@sync
+async def test_exit_stack_checkpoint_no_event_loop_dependency():
+    """The custom synchronous test loop is enough: no asyncio scheduling happens"""
+    witness: list[str] = []
+
+    async with a.ExitStack() as stack:
+        async with stack.checkpoint() as group:
+            # plain synchronous callbacks never yield to any event loop
+            group.callback(witness.append, "g")
+        stack.callback(witness.append, "outer")
+    assert witness == ["outer", "g"]

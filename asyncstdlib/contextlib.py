@@ -267,6 +267,10 @@ class ExitStack:
         Unlike :py:class:`contextlib.AsyncExitStack`, this class provides
         an :term:`async neutral` version of the :py:class:`contextlib.ExitStack`.
         There are no separate methods to distinguish async and regular arguments.
+
+    Exit actions can also be grouped into opt-in :meth:`checkpoint` scopes.
+    Actions registered on a checkpoint are staged separately and are either
+    committed to the surrounding stack as a unit or rolled back on their own.
     """
 
     def __init__(self) -> None:
@@ -295,6 +299,46 @@ class ExitStack:
         new_stack = type(self)()
         new_stack._exit_callbacks, self._exit_callbacks = self._exit_callbacks, deque()
         return new_stack
+
+    def checkpoint(self) -> "ExitStackCheckpoint":
+        """
+        Open a checkpoint scope that stages exit actions separately
+
+        :return: an :py:class:`~.ExitStackCheckpoint` to register the
+                 exit actions of the checkpoint scope on
+
+        The returned checkpoint is an :term:`asynchronous context manager`
+        and provides the same :py:meth:`~.ExitStack.push`,
+        :py:meth:`~.ExitStack.callback` and
+        :py:meth:`~.ExitStack.enter_context` methods as this stack.
+        Exit actions registered on the checkpoint are staged there instead
+        of being added to this stack immediately:
+
+        * If the checkpoint block exits normally, its actions are *committed*,
+          i.e. appended to the surrounding stack in registration order.
+          They are then run exactly once when the surrounding stack unwinds,
+          in the usual LIFO order.
+
+        * If the checkpoint block exits with an exception, its actions are
+          *rolled back*, i.e. run immediately in reverse registration order
+          with the same exception propagation and suppression semantics as
+          a regular :py:class:`~.ExitStack`. The surrounding stack never
+          runs any of these actions.
+
+        .. code-block:: python3
+
+            async with a.ExitStack() as stack:
+                stack.callback(cleanup_outer)
+                async with stack.checkpoint() as checkpoint:
+                    checkpoint.callback(cleanup_inner)
+                    await checkpoint.enter_context(resource)
+                # exiting normally commits both actions to ``stack``
+
+        Checkpoints can be nested by calling :py:meth:`~.ExitStack.checkpoint`
+        on a checkpoint itself. The checkpoint is :term:`async neutral` and
+        does not depend on any specific event loop.
+        """
+        return ExitStackCheckpoint(self)
 
     def push(self, exit: SE) -> SE:
         """
@@ -468,3 +512,107 @@ class ExitStack:
                 exc_val.__context__ = exc_context
                 raise
         return received_exc and suppress_exc
+
+
+class ExitStackCheckpoint(ExitStack):
+    """
+    A group of staged exit actions bound to a surrounding :py:class:`~.ExitStack`
+
+    Instances are created with :py:meth:`ExitStack.checkpoint` and are intended
+    to be used in an ``async with`` statement. While the checkpoint block is
+    active, :py:meth:`~ExitStack.push`, :py:meth:`~ExitStack.callback` and
+    :py:meth:`~ExitStack.enter_context` stage their exit actions on the
+    checkpoint instead of registering them with the surrounding stack.
+
+    When the block exits normally, the checkpoint is **committed**:
+    all staged actions are appended to the surrounding stack in registration
+    order and are run exactly once as part of the surrounding stack's LIFO
+    unwinding. When the block exits with an exception, the checkpoint is
+    **rolled back**: its staged actions are run immediately in reverse
+    registration order, with the same exception propagation, chaining and
+    suppression semantics as :py:class:`~.ExitStack`, and the surrounding
+    stack never runs any of them.
+
+    A checkpoint can only be finalized once. Calling :py:meth:`~ExitStack.aclose`
+    commits the checkpoint early; registering further actions or calling
+    :py:meth:`~ExitStack.pop_all` or :py:meth:`~ExitStack.checkpoint` after
+    finalization raises :py:exc:`RuntimeError`.
+    """
+
+    __slots__ = ("_checkpoint_parent", "_checkpoint_closed")
+
+    def __init__(self, parent: ExitStack) -> None:
+        super().__init__()
+        self._checkpoint_parent = parent
+        self._checkpoint_closed = False
+
+    def _require_open(self, action: str) -> None:
+        """Ensure that staging actions or transferring them is still allowed"""
+        if self._checkpoint_closed:
+            raise RuntimeError(f"cannot {action} on a closed ExitStack checkpoint")
+
+    def checkpoint(self) -> "ExitStackCheckpoint":
+        self._require_open("open a checkpoint")
+        return ExitStackCheckpoint(self)
+
+    def pop_all(self) -> ExitStack:
+        """
+        Transfer all currently staged exit callbacks to a new standalone stack
+
+        :return: new :py:class:`~.ExitStack` owning all previously staged
+                 callbacks
+
+        Only callbacks staged at the time of the call are transferred.
+        They are neither committed when this checkpoint exits normally nor
+        run when it is rolled back; the returned stack is fully independent
+        and must be closed on its own. Callbacks staged after calling
+        :py:meth:`~.pop_all` are committed or rolled back as usual.
+        """
+        self._require_open("pop all")
+        new_stack = ExitStack()
+        new_stack._exit_callbacks, self._exit_callbacks = (
+            self._exit_callbacks,
+            deque(),
+        )
+        return new_stack
+
+    def push(self, exit: SE) -> SE:
+        self._require_open("register an exit")
+        return super().push(exit)
+
+    def callback(self, callback: C, *args: Any, **kwargs: Any) -> C:
+        self._require_open("register a callback")
+        return super().callback(callback, *args, **kwargs)
+
+    async def enter_context(self, cm: AnyContextManager[T]) -> T:
+        # Check before entering so that a rejected context manager is never
+        # entered without its exit being staged as well.
+        self._require_open("enter a context")
+        return await super().enter_context(cm)
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, tb: Any) -> bool:
+        # Finalization happens at most once; this also covers repeated
+        # ``aclose`` calls and exiting the ``async with`` block afterwards.
+        if self._checkpoint_closed:
+            return False
+        self._checkpoint_closed = True
+        staged_callbacks = self._exit_callbacks
+        self._exit_callbacks = deque()
+        parent = self._checkpoint_parent
+        if exc_type is None and not (
+            isinstance(parent, ExitStackCheckpoint) and parent._checkpoint_closed
+        ):
+            # Commit: hand the staged actions to the surrounding stack in
+            # registration order so that its LIFO unwinding runs them once.
+            parent._exit_callbacks.extend(staged_callbacks)
+            return False
+        # Rollback (or a clean exit after the surrounding checkpoint was
+        # finalized manually): unwind the staged actions right here and now,
+        # using the full ExitStack exception semantics. Restore the deque so
+        # the inherited unwind loop operates on it, and clear it afterwards
+        # no matter how unwinding concludes.
+        self._exit_callbacks = staged_callbacks
+        try:
+            return await super().__aexit__(exc_type, exc_val, tb)
+        finally:
+            self._exit_callbacks.clear()

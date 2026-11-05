@@ -58,6 +58,32 @@ Context Managers
 
     .. automethod:: pop_all
 
+    .. automethod:: checkpoint
+
     .. automethod:: aclose
 
     .. versionadded:: 1.1.0
+
+.. autoclass:: ExitStackCheckpoint
+
+    An opt-in group of exit actions created by :py:meth:`ExitStack.checkpoint`.
+    It supports the same :py:meth:`~ExitStack.push`,
+    :py:meth:`~ExitStack.callback`, :py:meth:`~ExitStack.enter_context`,
+    :py:meth:`~ExitStack.pop_all`, :py:meth:`~ExitStack.checkpoint` and
+    :py:meth:`~ExitStack.aclose` methods as an :py:class:`ExitStack`.
+
+    Exiting the checkpoint block normally **commits** its staged actions
+    to the surrounding stack in registration order, so the surrounding
+    stack runs them exactly once in its usual LIFO unwinding.
+    Exiting it with an exception **rolls back** the staged actions
+    immediately in reverse registration order, preserving the exception
+    propagation and suppression semantics of an :py:class:`ExitStack`;
+    the surrounding stack never runs them.
+
+    A checkpoint is finalized at most once. After committing, rolling back
+    or closing it, any attempt to register or transfer actions raises
+    :py:exc:`RuntimeError`.
+
+    .. automethod:: aclose
+
+    .. versionadded:: 3.15.0

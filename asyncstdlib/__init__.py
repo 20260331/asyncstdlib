@@ -25,6 +25,7 @@ from .contextlib import (
     contextmanager,
     nullcontext,
     ExitStack,
+    ExitStackCheckpoint,
 )
 from .itertools import (
     accumulate,
@@ -75,6 +76,7 @@ __all__ = [
     "contextmanager",
     "nullcontext",
     "ExitStack",
+    "ExitStackCheckpoint",
     # itertools
     "accumulate",
     "batched",

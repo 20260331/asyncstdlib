@@ -16,6 +16,7 @@ from ._typing import T, AC, AnyIterable, R
 from ._core import ScopedIter, awaitify as _awaitify, Sentinel
 from .builtins import anext
 from .contextlib import nullcontext
+from .quota import _QuotaStop
 
 from ._lrucache import (
     lru_cache,
@@ -308,6 +309,10 @@ async def reduce(
                 "reduce() of empty sequence with no initial value"
             ) from None
         function = _awaitify(function)
-        async for head in item_iter:
-            value = await function(value, head)
+        try:
+            async for head in item_iter:
+                value = await function(value, head)
+        except _QuotaStop:
+            # a stopping quota: return the value accumulated so far
+            pass
     return value

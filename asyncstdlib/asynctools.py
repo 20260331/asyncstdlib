@@ -17,10 +17,26 @@ from typing import (
 )
 
 from ._typing import T, T1, T2, T3, T4, T5, AnyIterable
-from ._core import aiter
+from ._core import _aiter_raw
 from .contextlib import nullcontext
+from .quota import (
+    charge as _quota_charge,
+    owned as _owned,
+    quota_boundary,
+)
 
 S = TypeVar("S")
+
+
+def _charge_or_close(awaitable: Awaitable[T], **amounts: int) -> None:
+    """Charge ``amounts`` or close ``awaitable`` if the quota is exhausted"""
+    try:
+        _quota_charge(**amounts)
+    except BaseException:  # noqa: B036
+        close = getattr(awaitable, "close", None)
+        if close is not None:
+            close()
+        raise
 
 
 class _BorrowedAsyncIterator(AsyncGenerator[T, S]):
@@ -119,11 +135,13 @@ class _ScopedAsyncIteratorContext(AsyncContextManager[AsyncIterator[T]]):
 
 
 @overload
-def borrow(iterator: AsyncGenerator[T, S], /) -> AsyncGenerator[T, S]: ...
+def borrow(iterator: AsyncGenerator[T, S], /) -> AsyncGenerator[T, S]:
+    ...
 
 
 @overload
-def borrow(iterator: AsyncIterator[T], /) -> AsyncIterator[T]: ...
+def borrow(iterator: AsyncIterator[T], /) -> AsyncIterator[T]:
+    ...
 
 
 def borrow(
@@ -188,7 +206,9 @@ def scoped_iter(iterable: AnyIterable[T], /) -> AsyncContextManager[AsyncIterato
     """
     # The iterable cannot be closed.
     # We do not need to take care of it.
-    if not hasattr(iterator := aiter(iterable), "aclose"):
+    # Open without binding a quota: the scope only manages *lifetime*, while
+    # whoever iterates the scoped iterator accounts for the pulled elements.
+    if not hasattr(iterator := _aiter_raw(iterable), "aclose"):
         return nullcontext(iterator)
     # `iterator` might be already borrowed. We must not special-case this as:
     # - we cannot unwrap the underlying iterator, as this would give us longer access
@@ -196,6 +216,8 @@ def scoped_iter(iterable: AnyIterable[T], /) -> AsyncContextManager[AsyncIterato
     return _ScopedAsyncIteratorContext(iterator)
 
 
+@quota_boundary
+@_owned
 async def await_each(awaitables: Iterable[Awaitable[T]], /) -> AsyncIterable[T]:
     """
     Iterate through ``awaitables`` and await each item
@@ -224,6 +246,8 @@ async def await_each(awaitables: Iterable[Awaitable[T]], /) -> AsyncIterable[T]:
         )
     """
     for awaitable in awaitables:
+        # each awaitable is one awaited step producing one item
+        _charge_or_close(awaitable, awaits=1, items=1)
         yield await awaitable
 
 
@@ -232,7 +256,8 @@ async def apply(
     __func: Callable[[T1], T],
     __arg1: Awaitable[T1],
     /,
-) -> T: ...
+) -> T:
+    ...
 
 
 @overload
@@ -241,7 +266,8 @@ async def apply(
     __arg1: Awaitable[T1],
     __arg2: Awaitable[T2],
     /,
-) -> T: ...
+) -> T:
+    ...
 
 
 @overload
@@ -251,7 +277,8 @@ async def apply(
     __arg2: Awaitable[T2],
     __arg3: Awaitable[T3],
     /,
-) -> T: ...
+) -> T:
+    ...
 
 
 @overload
@@ -262,7 +289,8 @@ async def apply(
     __arg3: Awaitable[T3],
     __arg4: Awaitable[T4],
     /,
-) -> T: ...
+) -> T:
+    ...
 
 
 @overload
@@ -274,7 +302,8 @@ async def apply(
     __arg4: Awaitable[T4],
     __arg5: Awaitable[T5],
     /,
-) -> T: ...
+) -> T:
+    ...
 
 
 @overload
@@ -283,7 +312,8 @@ async def apply(
     /,
     *args: Awaitable[Any],
     **kwargs: Awaitable[Any],
-) -> T: ...
+) -> T:
+    ...
 
 
 async def apply(
@@ -317,11 +347,13 @@ async def apply(
 
 
 @overload
-def sync(function: Callable[..., Awaitable[T]], /) -> Callable[..., Awaitable[T]]: ...
+def sync(function: Callable[..., Awaitable[T]], /) -> Callable[..., Awaitable[T]]:
+    ...
 
 
 @overload
-def sync(function: Callable[..., T], /) -> Callable[..., Awaitable[T]]: ...
+def sync(function: Callable[..., T], /) -> Callable[..., Awaitable[T]]:
+    ...
 
 
 def sync(function: Callable[..., Any], /) -> Callable[..., Any]:
@@ -374,6 +406,8 @@ def sync(function: Callable[..., Any], /) -> Callable[..., Any]:
     return async_wrapped
 
 
+@quota_boundary
+@_owned
 async def any_iter(
     __iter: Union[
         Awaitable[AnyIterable[Awaitable[T]]],
@@ -417,11 +451,17 @@ async def any_iter(
     iterable = __iter if not isinstance(__iter, Awaitable) else await __iter
     if isinstance(iterable, AsyncIterable):
         async for item in iterable:
-            yield (
-                item if not isinstance(item, Awaitable) else await item
-            )  # pyright: ignore[reportReturnType]
+            if isinstance(item, Awaitable):
+                _charge_or_close(item, awaits=1, items=1)
+                yield (await item)  # pyright: ignore[reportReturnType]
+            else:
+                _quota_charge(items=1)
+                yield item
     else:
         for item in iterable:
-            yield (
-                item if not isinstance(item, Awaitable) else await item
-            )  # pyright: ignore[reportReturnType]
+            if isinstance(item, Awaitable):
+                _charge_or_close(item, awaits=1, items=1)
+                yield (await item)  # pyright: ignore[reportReturnType]
+            else:
+                _quota_charge(items=1)
+                yield item

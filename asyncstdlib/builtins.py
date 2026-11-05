@@ -21,6 +21,7 @@ from ._core import (
     awaitify as _awaitify,
     Sentinel,
 )
+from .quota import _QuotaStop, owned as _owned, quota_boundary
 
 __ANEXT_DEFAULT = Sentinel("<no default>")
 
@@ -117,6 +118,7 @@ async def any(iterable: AnyIterable[Any]) -> bool:
     return False
 
 
+@_owned
 async def zip(
     *iterables: AnyIterable[Any], strict: bool = False
 ) -> AsyncIterator[Tuple[Any, ...]]:
@@ -161,6 +163,7 @@ async def zip(
                 await aclose()
 
 
+@_owned
 async def _zip_inner(
     aiters: Tuple[AsyncIterator[T], ...],
 ) -> AsyncIterator[Tuple[T, ...]]:
@@ -172,6 +175,7 @@ async def _zip_inner(
         return
 
 
+@_owned
 async def _zip_inner_strict(
     aiters: Tuple[AsyncIterator[T], ...],
 ) -> AsyncIterator[Tuple[T, ...]]:
@@ -202,6 +206,8 @@ async def _zip_inner_strict(
         return
 
 
+@quota_boundary
+@_owned
 async def map(
     function: Union[Callable[..., R], Callable[..., Awaitable[R]]],
     iterable: AnyIterable[Any],
@@ -310,21 +316,27 @@ async def _min_max(
         if best is __MIN_MAX_DEFAULT:  # type: ignore
             name = "max" if invert else "min"
             raise ValueError(f"{name}() arg is an empty sequence")
-        elif key is None:
-            async for item in item_iter:
-                if invert ^ bool(item < best):
-                    best = item
-        else:
-            key = _awaitify(key)
-            best_key = await key(best)
-            async for item in item_iter:
-                item_key = await key(item)
-                if invert ^ (item_key < best_key):
-                    best = item
-                    best_key = item_key
+        try:
+            if key is None:
+                async for item in item_iter:
+                    if invert ^ bool(item < best):
+                        best = item
+            else:
+                key = _awaitify(key)
+                best_key = await key(best)
+                async for item in item_iter:
+                    item_key = await key(item)
+                    if invert ^ (item_key < best_key):
+                        best = item
+                        best_key = item_key
+        except _QuotaStop:
+            # a stopping quota: keep the best value found so far
+            pass
     return best
 
 
+@quota_boundary
+@_owned
 async def filter(
     function: Union[Callable[[T], bool], Callable[[T], Awaitable[bool]], None],
     iterable: AnyIterable[T],
@@ -350,6 +362,7 @@ async def filter(
                     yield item
 
 
+@_owned
 async def enumerate(
     iterable: AnyIterable[T], start: int = 0
 ) -> AsyncIterator[Tuple[int, T]]:
@@ -455,6 +468,12 @@ async def sorted(
             return items
     else:
         async_key = _awaitify(key)
-        keyed_items = [(await async_key(item), item) async for item in aiter(iterable)]
+        keyed_items: _sync_builtins.list[Tuple[Any, T]] = []
+        try:
+            async for item in aiter(iterable):
+                keyed_items.append((await async_key(item), item))
+        except _QuotaStop:
+            # a stopping quota: sort the partial results collected so far
+            pass
         keyed_items.sort(key=lambda ki: ki[0], reverse=reverse)
         return [item for _, item in keyed_items]

@@ -41,6 +41,7 @@ The missing ``async`` toolbox
    source/api/itertools
    source/api/heapq
    source/api/asynctools
+   source/api/quota
 
 .. toctree::
    :maxdepth: 2
@@ -102,6 +103,11 @@ with the same name as those of the Python standard library.
     :py:func:`~asyncstdlib.heapq.nlargest`, and
     :py:func:`~asyncstdlib.heapq.nsmallest`.
 
+:py:mod:`asyncstdlib.quota`
+    Provides the optional :py:class:`~asyncstdlib.Quota` context manager to
+    cooperatively bound iteration by items, awaits, buffered elements and user
+    defined weights, with explicit partial-result or exception behaviour.
+
 For simplicity, the :py:mod:`asyncstdlib` namespace also exposes all individual
 functions and classes directly.
 For example, :py:mod:`asyncstdlib.builtins.enumerate` is also available
@@ -148,6 +154,9 @@ an active event loop. Thus, all utilities of :py:mod:`asyncstdlib` that work on 
 iterators will eagerly :py:meth:`~agen.aclose` them.
 Use :py:func:`~asyncstdlib.asynctools.borrow` to prevent automatic cleanup,
 and :py:func:`~asyncstdlib.asynctools.scoped_iter` to guarantee cleanup in custom code.
+The optional :py:mod:`~asyncstdlib.quota` context builds on the same guarantee:
+when an iteration quota is exhausted, every iterator opened by
+:py:mod:`asyncstdlib` for the affected pipeline is closed.
 
 See the guide on :ref:`guide_iteration` for details and usage examples.
 

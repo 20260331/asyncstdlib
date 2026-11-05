@@ -44,6 +44,7 @@ from .itertools import (
 )
 from .asynctools import borrow, scoped_iter, await_each, any_iter, apply, sync
 from .heapq import merge, nlargest, nsmallest
+from .quota import Quota, QuotaExceeded, HoldToken
 
 __version__ = "3.14.0"
 
@@ -101,4 +102,8 @@ __all__ = [
     "merge",
     "nlargest",
     "nsmallest",
+    # quota
+    "Quota",
+    "QuotaExceeded",
+    "HoldToken",
 ]

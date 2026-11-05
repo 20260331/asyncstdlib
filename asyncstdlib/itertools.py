@@ -28,6 +28,16 @@ from ._core import (
     awaitify as _awaitify,
     borrow as _borrow,
 )
+from .quota import (
+    HoldToken,
+    _hold,
+    _release,
+    _shared_hold,
+    _QuotaStop,
+    owned as _owned,
+    quota_guard,
+    quota_boundary,
+)
 from .builtins import (
     anext,
     zip,
@@ -40,6 +50,7 @@ S = TypeVar("S")
 T_co = TypeVar("T_co", covariant=True)
 
 
+@_owned
 async def cycle(iterable: AnyIterable[T]) -> AsyncIterator[T]:
     """
     An :term:`asynchronous iterator` indefinitely iterating over ``iterable``
@@ -55,15 +66,25 @@ async def cycle(iterable: AnyIterable[T]) -> AsyncIterator[T]:
     significant memory.
     """
     buffer: List[T] = []
-    async with ScopedIter(iterable) as async_iter:
-        async for item in async_iter:
-            buffer.append(item)
-            yield item
-    if not buffer:
-        return
-    while True:
-        for item in buffer:
-            yield item
+    holds: List[Optional[HoldToken]] = []
+    try:
+        async with quota_guard:
+            async with ScopedIter(iterable) as async_iter:
+                async for item in async_iter:
+                    # every first-pass item is retained for subsequent passes
+                    token = _hold()
+                    buffer.append(item)
+                    holds.append(token)
+                    yield item
+            if not buffer:
+                return
+            while True:
+                for item in buffer:
+                    yield item
+    finally:
+        # the buffer is released only once the cycle itself is closed
+        for token in holds:
+            _release(token)
 
 
 async def add(x: ADD, y: ADD) -> ADD:
@@ -71,6 +92,8 @@ async def add(x: ADD, y: ADD) -> ADD:
     return x + y
 
 
+@quota_boundary
+@_owned
 async def accumulate(
     iterable: AnyIterable[Any],
     function: Union[
@@ -116,6 +139,7 @@ async def accumulate(
             yield value
 
 
+@_owned
 async def batched(
     iterable: AnyIterable[T], n: int, strict: bool = False
 ) -> AsyncIterator[Tuple[T, ...]]:
@@ -128,19 +152,28 @@ async def batched(
     """
     if n < 1:
         raise ValueError("n must be at least one")
-    async with ScopedIter(iterable) as item_iter:
+    async with quota_guard, ScopedIter(iterable) as item_iter:
         batch: list[T] = []
+        holds: list[Optional[HoldToken]] = []
         try:
             while True:
+                for token in holds:
+                    _release(token)
+                holds.clear()
                 batch.clear()
                 for _ in range(n):
                     batch.append(await anext(item_iter))
+                    # the batch retains the item until it is yielded
+                    holds.append(_hold())
                 yield tuple(batch)
         except StopAsyncIteration:
             if batch:
                 if strict and len(batch) < n:
                     raise ValueError("batched(): incomplete batch") from None
                 yield tuple(batch)
+        finally:
+            for token in holds:
+                _release(token)
 
 
 class chain(AsyncIterator[T]):
@@ -156,13 +189,16 @@ class chain(AsyncIterator[T]):
     ``chain.from_iterable`` to avoid closing all iterables but those already processed.
     """
 
+    __asyncstdlib_owned__ = True
+
     __slots__ = ("_iterator", "_owned_iterators")
 
     @staticmethod
+    @_owned
     async def _chain_iterator(
         any_iterables: AnyIterable[AnyIterable[T]],
     ) -> AsyncGenerator[T, None]:
-        async with ScopedIter(any_iterables) as iterables:
+        async with ScopedIter(any_iterables, metered=False) as iterables:
             async for iterable in iterables:
                 async with ScopedIter(iterable) as iterator:
                     async for item in iterator:
@@ -199,6 +235,7 @@ class chain(AsyncIterator[T]):
         await self._iterator.aclose()
 
 
+@_owned
 async def compress(
     data: AnyIterable[T], selectors: AnyIterable[Any]
 ) -> AsyncIterator[T]:
@@ -220,6 +257,8 @@ async def compress(
                 yield item
 
 
+@quota_boundary
+@_owned
 async def dropwhile(
     predicate: Callable[[T], Any], iterable: AnyIterable[T]
 ) -> AsyncIterator[T]:
@@ -242,6 +281,8 @@ async def dropwhile(
             yield item
 
 
+@quota_boundary
+@_owned
 async def filterfalse(
     predicate: Union[Callable[[T], bool], Callable[[T], Awaitable[bool]], None],
     iterable: AnyIterable[T],
@@ -260,6 +301,7 @@ async def filterfalse(
                 yield item
 
 
+@_owned
 async def islice(iterable: AnyIterable[T], *args: Optional[int]) -> AsyncIterator[T]:
     """
     An :term:`asynchronous iterator` over items from ``iterable`` in a :py:class:`slice`
@@ -296,6 +338,8 @@ async def islice(iterable: AnyIterable[T], *args: Optional[int]) -> AsyncIterato
                     return
 
 
+@quota_boundary
+@_owned
 async def starmap(
     function: Union[Callable[..., T], Callable[..., Awaitable[T]]],
     iterable: AnyIterable[Iterable[Any]],
@@ -316,6 +360,8 @@ async def starmap(
             yield await function(*args)
 
 
+@quota_boundary
+@_owned
 async def takewhile(
     predicate: Callable[[T], Any], iterable: AnyIterable[T]
 ) -> AsyncIterator[T]:
@@ -352,10 +398,14 @@ class NoLock:
 _get_tee_index = _counter().__next__
 
 
-_TeeNode: "TypeAlias" = "list[T | _TeeNode[T]]"
+# a filled node is [value, next_node, hold]; an empty node is []
+_TeeNode: "TypeAlias" = "list[Any]"
 
 
 class TeePeer(Generic[T]):
+    # relays items of the single shared, metered source iterator
+    __asyncstdlib_owned__ = True
+
     def __init__(
         self,
         iterator: AsyncIterator[T],
@@ -374,18 +424,27 @@ class TeePeer(Generic[T]):
         return self
 
     async def __anext__(self) -> T:
-        # the buffer is a singly-linked list as [value, [value, [...]]] | []
+        # the buffer is a singly linked list of
+        # [value, next_node, hold] nodes, terminated by an empty [] node
         next_node = self._buffer
         value: T
         # for any most advanced TeePeer, the node is just []
-        # fetch the next value so we can mutate the node to [value, [...]]
+        # fetch the next value so we can mutate the node to [value, [...], hold]
         if not next_node:
             async with self._lock:
                 # Check if another peer produced an item while we were waiting for the lock
                 if not next_node:
-                    await self._extend_buffer(next_node)
-        # for any other TeePeer, the node is already some [value, [...]]
-        value, self._buffer = next_node  # type: ignore
+                    try:
+                        await self._extend_buffer(next_node)
+                    except _QuotaStop:
+                        # a stopping quota exhausted while buffering:
+                        # end this peer as if its source were exhausted
+                        raise StopAsyncIteration from None
+        # for any other TeePeer, the node is already some [value, [...], hold]
+        value, next_buffer, hold = next_node  # type: ignore
+        self._buffer = next_buffer  # type: ignore
+        if hold is not None:
+            hold.release()
         return value
 
     async def _extend_buffer(self, next_node: "_TeeNode[T]") -> None:
@@ -400,15 +459,34 @@ class TeePeer(Generic[T]):
         else:
             # skip nodes that were filled in the meantime
             while next_node:
-                _, next_node = next_node  # type: ignore
-            next_node[:] = next_value, []
+                _, next_node, _hold_token = next_node  # type: ignore
+            # the item is buffered until every current peer has passed it
+            next_node[:] = (
+                next_value,
+                [],
+                _shared_hold(len(self._tee_peers)),
+            )
+
+    def _release_pending(self) -> None:
+        """Release buffered quota shares for nodes not yet consumed"""
+        node = self._buffer
+        while node:
+            _, next_node, hold = node  # type: ignore
+            if hold is not None:
+                hold.release()
+            node = next_node  # type: ignore
 
     async def aclose(self) -> None:
+        self._release_pending()
         self._tee_peers.discard(self._tee_idx)
         if not self._tee_peers and isinstance(self._iterator, ACloseable):
             await self._iterator.aclose()
 
     def __del__(self) -> None:
+        try:
+            self._release_pending()
+        except Exception:  # pragma: no cover - best effort interpreter cleanup
+            pass
         self._tee_peers.discard(self._tee_idx)
 
 
@@ -483,10 +561,12 @@ class Tee(Generic[T]):
         return len(self._children)
 
     @overload
-    def __getitem__(self, item: int) -> AsyncIterator[T]: ...
+    def __getitem__(self, item: int) -> AsyncIterator[T]:
+        ...
 
     @overload
-    def __getitem__(self, item: slice) -> Tuple[AsyncIterator[T], ...]: ...
+    def __getitem__(self, item: slice) -> Tuple[AsyncIterator[T], ...]:
+        ...
 
     def __getitem__(
         self, item: Union[int, slice]
@@ -510,6 +590,8 @@ class Tee(Generic[T]):
 tee = Tee
 
 
+@quota_boundary
+@_owned
 async def pairwise(iterable: AnyIterable[T]) -> AsyncIterator[Tuple[T, T]]:
     """
     Yield successive, overlapping pairs of items from ``iterable``
@@ -518,19 +600,33 @@ async def pairwise(iterable: AnyIterable[T]) -> AsyncIterator[Tuple[T, T]]:
     is emitted if ``iterable`` has one or zero items; however, if there is one item
     ``pairwise`` will wait for and consume it before finishing.
     """
-    async with ScopedIter(iterable) as async_iter:
-        # any default is fine – we never yield it if there are not at least two items
-        prev = await anext(async_iter, None)
-        async for current in async_iter:
-            yield prev, current  # type: ignore
-            prev = current
+    async with quota_guard, ScopedIter(iterable) as async_iter:
+        try:
+            prev: T = await anext(async_iter)
+        except StopAsyncIteration:
+            # not a single item available: there is nothing to pair
+            return
+        # the previous item is retained until the next one is yielded
+        prev_hold: Optional[HoldToken] = _hold()
+        try:
+            async for current in async_iter:
+                yield prev, current  # type: ignore
+                # ``current`` becomes the retained look-behind item
+                _release(prev_hold)
+                prev_hold = None
+                prev = current
+                prev_hold = _hold()
+        finally:
+            _release(prev_hold)
 
 
+@_owned
 async def _repeat(value: T) -> AsyncIterator[T]:
     while True:
         yield value
 
 
+@_owned
 async def zip_longest(
     *iterables: AnyIterable[Any], fillvalue: Any = None
 ) -> AsyncIterator[Tuple[Any, ...]]:
@@ -588,6 +684,7 @@ class _GroupByState(Generic[R, T_co]):
         "_iterator",
         "_key_func",
         "_current_value",
+        "_current_hold",
         "target_key",
         "current_key",
         "current_group",
@@ -601,33 +698,49 @@ class _GroupByState(Generic[R, T_co]):
         self._iterator = iterator
         self._key_func = key_func
         self._current_value = self._sentinel
+        self._current_hold: Optional[HoldToken] = None
 
     async def step(self) -> None:
         # can raise StopAsyncIteration
+        # a value skipped by the parent is no longer retained
+        self._release_hold()
         value = await anext(self._iterator)
         key = await self._key_func(value)
+        # the value is retained until the current group consumes it
+        hold = _hold()
         self._current_value, self.current_key = value, key
+        self._current_hold = hold
 
     async def maybe_step(self) -> None:
         """Only step if there is no current value"""
         if self._current_value is self._sentinel:
             await self.step()
 
+    def _release_hold(self) -> None:
+        """Release the buffer slot held for the current value, if any"""
+        _release(self._current_hold)
+        self._current_hold = None
+
     def consume_value(self) -> T_co:
         """Return the current value after removing it from the current state"""
         value, self._current_value = self._current_value, self._sentinel
+        self._release_hold()
         return value
 
     async def aclose(self) -> None:
         """Close the underlying iterator"""
         if (group := self.current_group) is not None:
             await group.aclose()
+        self._release_hold()
         if isinstance(self._iterator, ACloseable):
             await self._iterator.aclose()
 
 
 class _Grouper(AsyncIterator[T_co], Generic[R, T_co]):
     """A single group iterator, part of a series of groups yielded by groupby"""
+
+    # groups only expose values already metered via the shared groupby state
+    __asyncstdlib_owned__ = True
 
     __slots__ = ("_target_key", "_state")
 
@@ -640,7 +753,11 @@ class _Grouper(AsyncIterator[T_co], Generic[R, T_co]):
         # the groupby already advanced to another group
         if state.current_group is not self:
             raise StopAsyncIteration
-        await state.maybe_step()
+        try:
+            await state.maybe_step()
+        except _QuotaStop:
+            # a stopping quota: end this group with the elements seen so far
+            raise StopAsyncIteration from None
         # the step advanced the iterator to another group
         if self._target_key != state.current_key:
             raise StopAsyncIteration
@@ -681,6 +798,8 @@ class GroupBy(AsyncIterator[Tuple[R, AsyncIterator[T_co]]], Generic[R, T_co]):
     lazy iteration and evaluation.
     """
 
+    __asyncstdlib_owned__ = True
+
     __slots__ = ("_state",)
 
     def __init__(
@@ -699,22 +818,26 @@ class GroupBy(AsyncIterator[Tuple[R, AsyncIterator[T_co]]], Generic[R, T_co]):
 
     async def __anext__(self) -> Tuple[R, AsyncIterator[T_co]]:
         state = self._state
-        # already disable the current group to avoid concurrency issues
-        state.current_group = None
-        await state.maybe_step()
         try:
-            target_key = state.target_key
-        except AttributeError:
-            # no target key yet, skip scanning
-            pass
-        else:
-            # scan to the next group
-            while state.current_key == target_key:
-                await state.step()
+            # already disable the current group to avoid concurrency issues
+            state.current_group = None
+            await state.maybe_step()
+            try:
+                target_key = state.target_key
+            except AttributeError:
+                # no target key yet, skip scanning
+                pass
+            else:
+                # scan to the next group
+                while state.current_key == target_key:
+                    await state.step()
 
-        state.target_key = current_key = state.current_key
-        state.current_group = group = _Grouper(current_key, state)
-        return (current_key, group)
+            state.target_key = current_key = state.current_key
+            state.current_group = group = _Grouper(current_key, state)
+            return (current_key, group)
+        except _QuotaStop:
+            # a stopping quota: end groupby with the groups produced so far
+            raise StopAsyncIteration from None
 
     async def aclose(self) -> None:
         await self._state.aclose()

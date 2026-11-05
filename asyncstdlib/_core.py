@@ -8,7 +8,6 @@ Any helpers in this module are *not* bound to maintaining a public interface,
 and offer less convenience to save on overhead.
 """
 
-from inspect import iscoroutinefunction
 from typing import (
     Any,
     AsyncIterator,
@@ -24,6 +23,7 @@ from typing import (
 from types import TracebackType
 
 from ._typing import T, AnyIterable
+from .quota import meter as _quota_meter, _active_quota
 
 
 class Sentinel:
@@ -52,15 +52,26 @@ def aiter(subject: AnyIterable[T]) -> AsyncIterator[T]:
     In either case, an async iterator is returned.
     """
     if isinstance(subject, AsyncIterable):
-        return subject.__aiter__()
+        iterator = subject.__aiter__()
     else:
-        return _aiter_sync(subject).__aiter__()
+        iterator = _aiter_sync(subject).__aiter__()
+    # bind iterators opened while a quota is active to that quota;
+    # with no active quota this is the unchanged iterator
+    return _quota_meter(iterator)
 
 
 async def _aiter_sync(iterable: Iterable[T]) -> AsyncIterator[T]:
     """Helper to provide an async iterator for a regular iterable"""
     for item in iterable:
         yield item
+
+
+def _aiter_raw(subject: AnyIterable[T]) -> AsyncIterator[T]:
+    """Open ``subject`` without binding it to the active iteration quota"""
+    if isinstance(subject, AsyncIterable):
+        return subject.__aiter__()
+    else:
+        return _aiter_sync(subject).__aiter__()
 
 
 class ScopedIter(Generic[T]):
@@ -73,8 +84,12 @@ class ScopedIter(Generic[T]):
 
     __slots__ = ("_iterator",)
 
-    def __init__(self, iterable: AnyIterable[T]):
-        self._iterator: AsyncIterator[T] = aiter(iterable)
+    def __init__(self, iterable: AnyIterable[T], *, metered: bool = True):
+        # structural iterables (e.g. the container of iterables of ``chain``)
+        # are not data sources and must not consume iteration quotas
+        self._iterator: AsyncIterator[T] = (
+            aiter(iterable) if metered else _aiter_raw(iterable)
+        )
 
     async def __aenter__(self) -> AsyncIterator[T]:
         return self._iterator
@@ -101,11 +116,20 @@ def borrow(iterator: AsyncIterator[T]) -> AsyncGenerator[T, None]:
 def awaitify(
     function: "Callable[..., Awaitable[T]] | Callable[..., T]",
 ) -> Callable[..., Awaitable[T]]:
-    """Ensure that ``function`` can be used in ``await`` expressions"""
-    if iscoroutinefunction(function):
-        return function
-    else:
-        return Awaitify(function)
+    """Ensure that ``function`` can be used in ``await`` expressions
+
+    The inspector passes an awaitable result through directly (without an
+    extra coroutine frame) and, while doing so, accounts for one asynchronous
+    step against the active iteration quota, if any.
+    """
+    return Awaitify(function)
+
+
+def _charge_active_await() -> None:
+    """Charge one asynchronous step against the active quota, if any"""
+    quota = _active_quota()
+    if quota is not None:
+        quota._charge(awaits=1)
 
 
 class Awaitify(Generic[T]):
@@ -122,12 +146,31 @@ class Awaitify(Generic[T]):
             value = self.__wrapped__(*args, **kwargs)
             if isinstance(value, Awaitable):
                 self._async_call = self.__wrapped__  # type: ignore
+                self._charge_await(value)
                 return value  # pyright: ignore
             else:
+                # a synchronous result incurs no asynchronous step
                 self._async_call = force_async(self.__wrapped__)  # type: ignore
                 return await_value(value)
+        elif async_call is self.__wrapped__:
+            # the wrapped callable itself provides awaitables
+            awaitable = async_call(*args, **kwargs)
+            self._charge_await(awaitable)
+            return awaitable
         else:
+            # the cached wrapper emulates awaiting for a sync callable,
+            # which does not incur an asynchronous step
             return async_call(*args, **kwargs)
+
+    @staticmethod
+    def _charge_await(awaitable: Awaitable[T]) -> None:
+        try:
+            _charge_active_await()
+        except BaseException:  # noqa: B036 - must not leak the un-awaited value
+            close = getattr(awaitable, "close", None)
+            if close is not None:
+                close()
+            raise
 
 
 async def await_value(value: T) -> T:

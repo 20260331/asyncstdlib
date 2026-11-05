@@ -18,8 +18,10 @@ from ._typing import T, R, HK, LT, AnyIterable
 from ._core import (
     aiter,
     ScopedIter,
-    awaitify as _awaitify,
     Sentinel,
+    awaitify as _awaitify,
+    _audit_claim,
+    _audit_close,
 )
 
 __ANEXT_DEFAULT = Sentinel("<no default>")
@@ -147,6 +149,9 @@ async def zip(
         return
     aiters = (*(aiter(it) for it in iterables),)
     del iterables
+    owner = Sentinel("asyncstdlib.builtins.zip")
+    for iterator in aiters:
+        _audit_claim(iterator, owner)
     try:
         inner = _zip_inner(aiters) if not strict else _zip_inner_strict(aiters)
         async for items in inner:
@@ -158,6 +163,7 @@ async def zip(
             except AttributeError:
                 pass
             else:
+                _audit_close(iterator, owner)
                 await aclose()
 
 

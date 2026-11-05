@@ -16,7 +16,7 @@ from functools import partial
 import sys
 
 from ._typing import AClose, ContextManager, AC, T, C
-from ._core import awaitify
+from ._core import awaitify, _audit_claim, _audit_close
 from ._utility import public_module
 
 AnyContextManager = Union[AsyncContextManager[T], ContextManager[T]]
@@ -197,9 +197,14 @@ class Closing(Generic[AClose]):
         self.thing = thing
 
     async def __aenter__(self) -> AClose:
+        if hasattr(self.thing, "__anext__"):
+            # the scope assumes ownership of an async iterator it closes
+            _audit_claim(self.thing, self)
         return self.thing
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if hasattr(self.thing, "__anext__"):
+            _audit_close(self.thing, self)
         await self.thing.aclose()
 
 

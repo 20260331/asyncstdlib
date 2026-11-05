@@ -20,6 +20,17 @@ Iterator lifetime
 .. autofunction:: scoped_iter(iterable: (async) iter T)
     :async-with: :async iter T
 
+.. autofunction:: ownership_audit(*, raise_on_exit: bool = True, name: str | None = None)
+    :async-with: :OwnershipAudit
+
+.. autoclass:: asyncstdlib.OwnershipAudit()
+    :members:
+
+.. autoclass:: asyncstdlib.Violation()
+    :members:
+
+.. autoclass:: asyncstdlib.OwnershipViolation()
+
 Async transforming
 ==================
 

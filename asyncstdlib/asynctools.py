@@ -17,7 +17,15 @@ from typing import (
 )
 
 from ._typing import T, T1, T2, T3, T4, T5, AnyIterable
-from ._core import aiter
+from ._core import (
+    aiter,
+    OwnershipAudit,
+    _OwnershipAuditScope,
+    _audit_borrow,
+    _audit_claim,
+    _audit_close,
+    _audit_return,
+)
 from .contextlib import nullcontext
 
 S = TypeVar("S")
@@ -31,7 +39,14 @@ class _BorrowedAsyncIterator(AsyncGenerator[T, S]):
     # adding special methods such as `__anext__` as `__slots__` allows to set them
     # on the instance: the interpreter expects *descriptors* not methods, and
     # `__slots__` are descriptors just like methods.
-    __slots__ = "__wrapped__", "__anext__", "asend", "athrow", "_wrapper"
+    __slots__ = (
+        "__wrapped__",
+        "__anext__",
+        "asend",
+        "athrow",
+        "_wrapper",
+        "__weakref__",
+    )
 
     # Type checker does not understand `__slot__` definitions
     __anext__: Callable[..., Coroutine[Any, Any, T]]
@@ -57,6 +72,7 @@ class _BorrowedAsyncIterator(AsyncGenerator[T, S]):
             self.athrow = (
                 iterator.athrow  # pyright: ignore[reportUnknownMemberType,reportAttributeAccessIssue]
             )
+        _audit_borrow(iterator, self)
 
     def __aiter__(self) -> AsyncGenerator[T, S]:
         return self
@@ -75,6 +91,7 @@ class _BorrowedAsyncIterator(AsyncGenerator[T, S]):
             self.asend = wrapper_iterator.asend
         if hasattr(self, "athrow"):
             self.athrow = wrapper_iterator.athrow
+        _audit_return(self)
 
     def aclose(self) -> Coroutine[Any, Any, None]:
         return self._aclose_wrapper()
@@ -103,6 +120,7 @@ class _ScopedAsyncIteratorContext(AsyncContextManager[AsyncIterator[T]]):
     def __init__(self, iterator: AsyncIterator[T]):
         self._iterator: AsyncIterator[T] = iterator
         self._borrowed_iter: Optional[_ScopedAsyncIterator[T, Any]] = None
+        _audit_claim(iterator, self)
 
     async def __aenter__(self) -> AsyncIterator[T]:
         if self._borrowed_iter is not None:
@@ -112,6 +130,7 @@ class _ScopedAsyncIteratorContext(AsyncContextManager[AsyncIterator[T]]):
 
     async def __aexit__(self, *args: Any) -> None:
         await self._borrowed_iter._aclose_wrapper()  # type: ignore
+        _audit_close(self._iterator, self)
         await self._iterator.aclose()  # type: ignore
 
     def __repr__(self) -> str:
@@ -194,6 +213,47 @@ def scoped_iter(iterable: AnyIterable[T], /) -> AsyncContextManager[AsyncIterato
     # - we cannot unwrap the underlying iterator, as this would give us longer access
     # - we still must create a separate scope with its own lifetime
     return _ScopedAsyncIteratorContext(iterator)
+
+
+def ownership_audit(
+    *, raise_on_exit: bool = True, name: Optional[str] = None
+) -> AsyncContextManager[OwnershipAudit]:
+    r"""
+    Opt-in scope recording async iterator ownership events of ``asyncstdlib``
+
+    Entering the scope turns on ownership auditing for the current task until
+    the block exits. Every :py:mod:`asyncstdlib` combinator running in the
+    block reports when it assumes ownership ("claim"), :term:`borrows
+    <borrowing>`, returns or ``aclose``\ s an async iterator.
+    The scope only observes the ``asyncstdlib`` wrapper layer -- iterators
+    passed in by user code are never wrapped, replaced or monkey-patched.
+
+    On exit, the scope reports violations such as:
+
+    * a borrowed iterator handle that was not returned before exit,
+    * the same iterator closed twice via separate ownership chains,
+    * an iterator closed by a wrapper that did not currently own it.
+
+    By default the scope raises :class:`~asyncstdlib.OwnershipViolation` on
+    exit if violations were found and the block itself did not raise.
+    If the block raised, the original exception is propagated unchanged;
+    on Python 3.11+ the audit result is attached as an exception note.
+    The report is always available on the scope value regardless.
+
+    .. code-block:: python3
+
+        import asyncstdlib as a
+
+        async def main():
+            async with a.ownership_audit() as audit:
+                async for item in a.islice(produce(), 5):
+                    ...
+            assert not audit.violations
+
+    :param raise_on_exit: raise on a clean block exit when violations exist
+    :param name: optional label used when presenting audit results
+    """
+    return _OwnershipAuditScope(raise_on_exit=raise_on_exit, name=name)
 
 
 async def await_each(awaitables: Iterable[Awaitable[T]], /) -> AsyncIterable[T]:

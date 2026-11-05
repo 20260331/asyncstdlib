@@ -86,4 +86,33 @@ Scoped iterators should be the go-to approach for managing iterator lifetimes.
 However, not all lifetimes correspond to well-defined lexical scopes;
 for these cases, one can :term:`borrow <borrowing>` an iterator instead.
 
+Auditing iterator ownership
+============================
+
+The ownership rules above can be checked explicitly using
+:py:func:`~asyncstdlib.ownership_audit`.
+The resulting scope records when the :py:mod:`asyncstdlib` wrappers assume
+ownership, :term:`borrow <borrowing>`, return and ``aclose`` async iterators.
+
+.. code-block:: python3
+
+    >>> import asyncstdlib as a
+    >>>
+    >>> async def main():
+    ...     async with a.ownership_audit() as audit:
+    ...         async for item in a.islice(produce(), 5):
+    ...             ...
+    ...     assert not audit.violations
+
+On exit, the scope reports violations such as borrowed handles that were not
+returned, the same iterator being closed through separate ownership chains,
+and an iterator being closed by a wrapper that did not currently own it.
+By default :class:`~asyncstdlib.OwnershipViolation` is raised on exit when
+violations were found and the block itself did not raise;
+if the block did raise, the original exception is propagated unchanged.
+
+Auditing is strictly opt-in and observatory:
+user iterators are never wrapped, replaced or monkey-patched, and audited code
+behaves identically when no audit scope is active.
+
 .. _PEP 533: https://www.python.org/dev/peps/pep-0533/

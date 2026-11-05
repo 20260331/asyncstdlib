@@ -25,8 +25,11 @@ from ._typing import ACloseable, R, T, AnyIterable, ADD
 from ._utility import public_module
 from ._core import (
     ScopedIter,
+    Sentinel,
     awaitify as _awaitify,
     borrow as _borrow,
+    _audit_claim,
+    _audit_close,
 )
 from .builtins import (
     anext,
@@ -177,6 +180,11 @@ class chain(AsyncIterator[T]):
             for iterable in iterables
             if isinstance(iterable, AsyncIterator) and isinstance(iterable, ACloseable)
         )
+        # the chain assumes ownership of iterators passed positionally;
+        # the inner ``ScopedIter`` for each processed iterable is a
+        # transparent transfer within the same ownership episode
+        for iterable in self._owned_iterators:
+            _audit_claim(iterable, self)
 
     @classmethod
     def from_iterable(cls, iterable: AnyIterable[AnyIterable[T]]) -> "chain[T]":
@@ -195,6 +203,7 @@ class chain(AsyncIterator[T]):
 
     async def aclose(self) -> None:
         for iterable in self._owned_iterators:
+            _audit_close(iterable, self)
             await iterable.aclose()
         await self._iterator.aclose()
 
@@ -362,11 +371,13 @@ class TeePeer(Generic[T]):
         buffer: "_TeeNode[T]",
         lock: AsyncContextManager[Any],
         tee_peers: "set[int]",
+        owner: Any = None,
     ) -> None:
         self._iterator = iterator
         self._lock = lock
         self._buffer: _TeeNode[T] = buffer
         self._tee_peers = tee_peers
+        self._owner = owner
         self._tee_idx = _get_tee_index()
         self._tee_peers.add(self._tee_idx)
 
@@ -406,6 +417,7 @@ class TeePeer(Generic[T]):
     async def aclose(self) -> None:
         self._tee_peers.discard(self._tee_idx)
         if not self._tee_peers and isinstance(self._iterator, ACloseable):
+            _audit_close(self._iterator, self._owner)
             await self._iterator.aclose()
 
     def __del__(self) -> None:
@@ -465,16 +477,22 @@ class Tee(Generic[T]):
             iterator = aiter(iterable)
             buffer = []
             peers = set()
+            owner: Any = Sentinel("asyncstdlib.itertools.tee")
         else:
             iterator = iterable._iterator  # pyright: ignore[reportPrivateUsage]
             buffer = iterable._buffer  # pyright: ignore[reportPrivateUsage]
             peers = iterable._tee_peers  # pyright: ignore[reportPrivateUsage]
+            # share the parent's ownership so the last peer group closing
+            # the shared iterator is recognised as its owner
+            owner = iterable._owner
+        _audit_claim(iterator, owner)
         self._children = tuple(
             TeePeer(
                 iterator,
                 buffer,
                 lock if lock is not None else NoLock(),
                 peers,
+                owner,
             )
             for _ in range(n)
         )
@@ -552,6 +570,9 @@ async def zip_longest(
     fill_iter = aiter(_repeat(fillvalue))
     async_iters = [aiter(it) for it in iterables]
     del iterables
+    owner = Sentinel("asyncstdlib.itertools.zip_longest")
+    for iterator in async_iters:
+        _audit_claim(iterator, owner)
     try:
         remaining = len(async_iters)
         while True:
@@ -573,6 +594,7 @@ async def zip_longest(
         await fill_iter.aclose()  # type: ignore
         for iterator in async_iters:
             if isinstance(iterator, ACloseable):
+                _audit_close(iterator, owner)
                 await iterator.aclose()
 
 
@@ -601,6 +623,7 @@ class _GroupByState(Generic[R, T_co]):
         self._iterator = iterator
         self._key_func = key_func
         self._current_value = self._sentinel
+        _audit_claim(iterator, self)
 
     async def step(self) -> None:
         # can raise StopAsyncIteration
@@ -623,6 +646,7 @@ class _GroupByState(Generic[R, T_co]):
         if (group := self.current_group) is not None:
             await group.aclose()
         if isinstance(self._iterator, ACloseable):
+            _audit_close(self._iterator, self)
             await self._iterator.aclose()
 
 

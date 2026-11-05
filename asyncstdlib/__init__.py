@@ -42,7 +42,16 @@ from .itertools import (
     zip_longest,
     groupby,
 )
-from .asynctools import borrow, scoped_iter, await_each, any_iter, apply, sync
+from .asynctools import (
+    borrow,
+    scoped_iter,
+    await_each,
+    any_iter,
+    apply,
+    sync,
+    ownership_audit,
+)
+from ._core import OwnershipAudit, OwnershipViolation, Violation
 from .heapq import merge, nlargest, nsmallest
 
 __version__ = "3.14.0"
@@ -97,6 +106,10 @@ __all__ = [
     "any_iter",
     "apply",
     "sync",
+    "ownership_audit",
+    "OwnershipAudit",
+    "OwnershipViolation",
+    "Violation",
     # heapq
     "merge",
     "nlargest",

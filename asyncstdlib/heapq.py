@@ -11,7 +11,14 @@ from typing import (
 import heapq as _heapq
 
 from .builtins import enumerate as a_enumerate, zip as a_zip
-from ._core import aiter, awaitify, ScopedIter, borrow
+from ._core import (
+    aiter,
+    awaitify,
+    ScopedIter,
+    borrow,
+    _audit_claim,
+    _audit_close,
+)
 from ._typing import AnyIterable, ACloseable, LT, T
 
 
@@ -77,7 +84,10 @@ class _KeyIter(Generic[LT]):
                 pass
             else:
                 head_key = await key(head) if key is not None else head
-                yield cls(head, iterator, reverse, head_key, key)
+                key_iter = cls(head, iterator, reverse, head_key, key)
+                # the ``_KeyIter`` owns ``iterator`` until ``merge`` closes it
+                _audit_claim(iterator, key_iter)
+                yield key_iter
 
     async def pull_head(self) -> bool:
         """
@@ -149,6 +159,7 @@ async def merge(
     finally:
         for itr, _ in iter_heap:
             if isinstance(itr.tail, ACloseable):
+                _audit_close(itr.tail, itr)
                 await itr.tail.aclose()
 
 

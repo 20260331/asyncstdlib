@@ -21,8 +21,12 @@ For example, an ``async`` key function would be used as
 Iterator merging
 ================
 
-.. autofunction:: merge(*iterables: (async) iter T, key: (T) → (await) Any = None, reverse: bool = False)
+.. autofunction:: merge(*iterables: (async) iter T, key: (T) → (await) Any = None, reverse: bool = False, prefetch: int | None = None)
     :async-for: :T
+
+The ``prefetch`` argument requires a running :py:mod:`asyncio` event loop
+and is only available when passing an integer; ``prefetch=None`` (the default)
+keeps the purely on-demand, event-loop-independent behaviour.
 
 Iterator selecting
 ==================

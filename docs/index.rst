@@ -40,6 +40,7 @@ The missing ``async`` toolbox
    source/api/contextlib
    source/api/itertools
    source/api/heapq
+   source/api/external
    source/api/asynctools
 
 .. toctree::
@@ -101,6 +102,12 @@ with the same name as those of the Python standard library.
     which is just :py:func:`~asyncstdlib.heapq.merge`,
     :py:func:`~asyncstdlib.heapq.nlargest`, and
     :py:func:`~asyncstdlib.heapq.nsmallest`.
+
+:py:mod:`asyncstdlib.external`
+    Optional external sorting that spills sorted runs to caller-provided
+    temporary storage when a memory budget is exceeded, stably merges them,
+    and exports run manifests for validation, resumption, and safe cleanup
+    after an interruption.
 
 For simplicity, the :py:mod:`asyncstdlib` namespace also exposes all individual
 functions and classes directly.
